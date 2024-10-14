@@ -1,62 +1,96 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { default: makeWASocket, useMultiFileAuthState, delay, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode');
 const express = require('express');
 
+// Replace 'YOUR_BOT_TOKEN' with your actual Telegram bot token
 const bot = new TelegramBot('7959549272:AAE6yg3a5EHa_qS-7zf5V7he8yk_x8_7Z1U', { polling: true });
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const tempDir = path.join(__dirname, 'temp');
-if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir);
+}
 
 function removeFile(filePath) {
-  if (fs.existsSync(filePath)) fs.rmSync(filePath, { recursive: true, force: true });
+  if (!fs.existsSync(filePath)) return false;
+  fs.rmSync(filePath, { recursive: true, force: true });
 }
 
 function makeid(length = 6) {
-  return Array.from({ length }, () => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 62)]).join('');
-}
-
-async function initWhatsApp(sessionDir) {
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: 'silent' })
-  });
-  sock.ev.on('creds.update', saveCreds);
-  return sock;
+  let result = '';
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  for (let i = 0; i < length; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
 }
 
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '*Welcome!*\nUse /pair <phone_number> to get a pairing code or /qr to get a QR code.', { parse_mode: 'Markdown' });
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, 'Welcome to KORD-AI - PAIRING');
+  bot.sendMessage(chatId, 'Use /pair <phone_number> to get a pairing code or /qr to get a QR code.');
 });
 
 bot.onText(/\/pair (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const phoneNumber = match[1].replace(/[^0-9]/g, '');
+  const phoneNumber = match[1];
 
-  if (!/^\+?[1-9]\d{10,14}$/.test(phoneNumber)) {
+  if (!phoneNumber.match(/^\+?[1-9]\d{1,14}$/)) {
     return bot.sendMessage(chatId, 'Please send a valid phone number.');
   }
 
-  const sessionDir = path.join(tempDir, makeid());
+  bot.sendMessage(chatId, 'Generating pairing code...');
+
+  const id = makeid();
+  const sessionDir = path.join(tempDir, id);
 
   try {
-    const sock = await initWhatsApp(sessionDir);
-    const code = await sock.requestPairingCode(phoneNumber);
-    bot.sendMessage(chatId, `Your pairing code is: *${code}*`, { parse_mode: 'Markdown' });
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const sock = makeWASocket({
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })),
+      },
+      printQRInTerminal: false,
+      logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
+      browser: ['Chrome (Linux)', '', ''],
+    });
 
-    sock.ev.on('connection.update', async ({ connection }) => {
-      if (connection === 'open') {
-        const creds = fs.readFileSync(path.join(sessionDir, 'creds.json'));
-        const b64creds = Buffer.from(creds).toString('base64');
-        bot.sendMessage(chatId, '*Success!*\nHere is your encoded session data:', { parse_mode: 'Markdown' });
-        bot.sendMessage(chatId, b64creds);
+    sock.ev.on('creds.update', saveCreds);
+
+    if (!sock.authState.creds.registered) {
+      await delay(1500);
+      const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
+      bot.sendMessage(chatId, `Your pairing code is: ${code}`);
+    }
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        if (shouldReconnect) {
+          bot.sendMessage(chatId, 'Connection closed. Reconnecting...');
+        } else {
+          bot.sendMessage(chatId, 'Connection closed. Logged out.');
+          removeFile(sessionDir);
+        }
+      } else if (connection === 'open') {
+        await delay(5000);
+        const credsPath = path.join(sessionDir, 'creds.json');
+        const data = fs.readFileSync(credsPath);
+        const b64data = Buffer.from(data).toString('base64');
+        
+        bot.sendMessage(chatId, 'Success!');
+        bot.sendMessage(chatId, 'Here is your encoded session data:');
+        bot.sendMessage(chatId, b64data);
+
+        await delay(1000);
         await sock.logout();
         removeFile(sessionDir);
       }
@@ -70,20 +104,49 @@ bot.onText(/\/pair (.+)/, async (msg, match) => {
 
 bot.onText(/\/qr/, async (msg) => {
   const chatId = msg.chat.id;
-  const sessionDir = path.join(tempDir, makeid());
+  bot.sendMessage(chatId, 'Generating QR code...');
+
+  const id = makeid();
+  const sessionDir = path.join(tempDir, id);
 
   try {
-    const sock = await initWhatsApp(sessionDir);
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const sock = makeWASocket({
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })),
+      },
+      printQRInTerminal: false,
+      logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
+      browser: ['Chrome (Linux)', '', ''],
+    });
 
-    sock.ev.on('connection.update', async ({ connection, qr }) => {
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, qr, lastDisconnect } = update;
       if (qr) {
         const qrImage = await qrcode.toDataURL(qr);
         bot.sendPhoto(chatId, Buffer.from(qrImage.split(',')[1], 'base64'), { caption: 'Scan this QR code to pair' });
+      } else if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        if (shouldReconnect) {
+          bot.sendMessage(chatId, 'Connection closed. Reconnecting...');
+        } else {
+          bot.sendMessage(chatId, 'Connection closed. Logged out.');
+          removeFile(sessionDir);
+        }
       } else if (connection === 'open') {
-        const creds = fs.readFileSync(path.join(sessionDir, 'creds.json'));
-        const b64creds = Buffer.from(creds).toString('base64');
-        bot.sendMessage(chatId, '*Success!*\nHere is your encoded session data:', { parse_mode: 'Markdown' });
-        bot.sendMessage(chatId, b64creds);
+        await delay(5000);
+        const credsPath = path.join(sessionDir, 'creds.json');
+        const data = fs.readFileSync(credsPath);
+        const b64data = Buffer.from(data).toString('base64');
+        
+        bot.sendMessage(chatId, 'Success!');
+        bot.sendMessage(chatId, 'Here is your encoded session data:');
+        bot.sendMessage(chatId, b64data);
+
+        await delay(1000);
         await sock.logout();
         removeFile(sessionDir);
       }
@@ -95,7 +158,14 @@ bot.onText(/\/qr/, async (msg) => {
   }
 });
 
-bot.on('polling_error', console.error);
+bot.on('polling_error', (error) => {
+  console.error(error);
+});
 
-app.get('/', (req, res) => res.send('Telegram Bot is running!'));
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+app.get('/', (req, res) => {
+  res.send('Telegram Bot is running!');
+});
+
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
