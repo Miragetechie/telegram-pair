@@ -1,0 +1,22 @@
+{
+  "name": "telegram-baileys-bot",
+  "version": "1.0.0",
+  "description": "A Telegram bot using WhiskeySockets/Baileys for WhatsApp pairing",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "whatsapp",
+    "baileys"
+  ],
+  "author": "M3264",
+  "license": "ISC",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.5.0",
+    "node-telegram-bot-api": "^0.64.0",
+    "pino": "^8.16.0"
+  }
+}
