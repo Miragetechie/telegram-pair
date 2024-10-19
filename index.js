@@ -1,12 +1,12 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { default: makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, DisconnectReason } = require('@whiskeysockets/baileys');
+const express = require('express');
+const { default: makeWASocket, useMultiFileAuthState, delay, DisconnectReason } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode');
-const express = require('express');
 
-// Replace 'YOUR_BOT_TOKEN' with your actual Telegram bot token
+// Replace with your actual Telegram bot token
 const bot = new TelegramBot('7959549272:AAE6yg3a5EHa_qS-7zf5V7he8yk_x8_7Z1U', { polling: true });
 
 const app = express();
@@ -31,74 +31,106 @@ function makeid(length = 6) {
   return result;
 }
 
+const userStates = {};
+
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   bot.sendMessage(chatId, 'Welcome to KORD-AI - PAIRING');
-  bot.sendMessage(chatId, 'Use /pair <phone_number> to get a pairing code or /qr to get a QR code.');
+  bot.sendMessage(chatId, 'Use /pair to start the pairing process or /qr to get a QR code.');
 });
 
-bot.onText(/\/pair (.+)/, async (msg, match) => {
+bot.onText(/\/pair/, (msg) => {
   const chatId = msg.chat.id;
-  const phoneNumber = match[1];
+  userStates[chatId] = 'awaitingPhoneNumber';
+  bot.sendPhoto(chatId, 'https://files.catbox.moe/g4q04p.png', {
+    caption: 'Please enter your phone number with country code (e.g., +1234567890):'
+  });
+});
 
-  if (!phoneNumber.match(/^\+?[1-9]\d{1,14}$/)) {
-    return bot.sendMessage(chatId, 'Please send a valid phone number.');
-  }
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  
+  if (userStates[chatId] === 'awaitingPhoneNumber') {
+    const phoneNumber = msg.text;
 
-  bot.sendMessage(chatId, 'Generating pairing code...');
-
-  const id = makeid();
-  const sessionDir = path.join(tempDir, id);
-
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const sock = makeWASocket({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })),
-      },
-      printQRInTerminal: false,
-      logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
-      browser: ['Chrome (Linux)', '', ''],
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    if (!sock.authState.creds.registered) {
-      await delay(1500);
-      const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
-      bot.sendMessage(chatId, `Your pairing code is: ${code}`);
+    if (!phoneNumber.match(/^\+?[1-9]\d{1,14}$/)) {
+      return bot.sendMessage(chatId, 'Please send a valid phone number with country code.');
     }
 
-    sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect } = update;
-      if (connection === 'close') {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        if (shouldReconnect) {
-          bot.sendMessage(chatId, 'Connection closed. Reconnecting...');
-        } else {
-          bot.sendMessage(chatId, 'Connection closed. Logged out.');
+    userStates[chatId] = null;
+    bot.sendMessage(chatId, 'Generating pairing code...');
+
+    const id = makeid();
+    const sessionDir = path.join(tempDir, id);
+
+    try {
+      const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+      const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' })
+      });
+
+      sock.ev.on('creds.update', saveCreds);
+
+      if (!sock.authState.creds.registered) {
+        await delay(1500);
+        const code = await sock.requestPairingCode(phoneNumber.replace(/[^0-9]/g, ''));
+        bot.sendMessage(chatId, `Your pairing code is: ${code}`);
+      }
+
+      sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'close') {
+          const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+          if (shouldReconnect) {
+            bot.sendMessage(chatId, 'Connection closed. Reconnecting...');
+          } else {
+            bot.sendMessage(chatId, 'Connection closed. Logged out.');
+            removeFile(sessionDir);
+          }
+        } else if (connection === 'open') {
+          await delay(5000);
+          const credsPath = path.join(sessionDir, 'creds.json');
+          const data = fs.readFileSync(credsPath);
+          const b64data = Buffer.from(data).toString('base64');
+          
+          const Kordtext = `
+┏━━━━━━
+┃𝑲𝒐𝒓𝒅 𝑨𝒊 𝑰𝒔 𝑪𝒐𝒏𝒏𝒆𝒄𝒕𝒆𝒅! ,✅🤖
+┗━━━━━━
+▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+_Use the Session Id To Deploy Your Bot, Add the Session id to The SESSION_ID variable in config.js_
+
+Repo link: *https://github.com/M3264/Kord-Ai*
+▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+❷ || WhattsApp Channel = https://whatsapp.com/channel/0029VaghjWRHVvTh35lfZ817
+▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+> © ɪɴᴛᴇʟʟɪɢᴇɴᴄᴇ ʙʏ ᴋᴏʀᴅ ɪɴᴄ³²¹™
+_Don't Forget To Give Star To My Repo_`;
+
+          // Send messages to WhatsApp
+          await sock.sendMessage(sock.user.id, { text: 'Success! Your session is connected.' });
+          await sock.sendMessage(sock.user.id, { text: 'Here is your encoded session data:' });
+          await sock.sendMessage(sock.user.id, { text: b64data });
+          await sock.sendMessage(sock.user.id, { text: Kordtext });
+
+          // Send messages to Telegram
+          bot.sendMessage(chatId, 'Success!');
+          bot.sendMessage(chatId, 'Here is your encoded session data:');
+          bot.sendMessage(chatId, b64data);
+          bot.sendMessage(chatId, Kordtext);
+
+          await delay(1000);
+          await sock.logout();
           removeFile(sessionDir);
         }
-      } else if (connection === 'open') {
-        await delay(5000);
-        const credsPath = path.join(sessionDir, 'creds.json');
-        const data = fs.readFileSync(credsPath);
-        const b64data = Buffer.from(data).toString('base64');
-        
-        bot.sendMessage(chatId, 'Success!');
-        bot.sendMessage(chatId, 'Here is your encoded session data:');
-        bot.sendMessage(chatId, b64data);
-
-        await delay(1000);
-        await sock.logout();
-        removeFile(sessionDir);
-      }
-    });
-  } catch (err) {
-    console.error(err);
-    bot.sendMessage(chatId, 'An error occurred. Please try again later.');
-    removeFile(sessionDir);
+      });
+    } catch (err) {
+      console.error(err);
+      bot.sendMessage(chatId, 'An error occurred. Please try again later.');
+      removeFile(sessionDir);
+    }
   }
 });
 
@@ -112,13 +144,9 @@ bot.onText(/\/qr/, async (msg) => {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const sock = makeWASocket({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }).child({ level: 'fatal' })),
-      },
+      auth: state,
       printQRInTerminal: false,
-      logger: pino({ level: 'fatal' }).child({ level: 'fatal' }),
-      browser: ['Chrome (Linux)', '', ''],
+      logger: pino({ level: 'silent' })
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -142,9 +170,31 @@ bot.onText(/\/qr/, async (msg) => {
         const data = fs.readFileSync(credsPath);
         const b64data = Buffer.from(data).toString('base64');
         
+        const Kordtext = `
+┏━━━━━━
+┃𝑲𝒐𝒓𝒅 𝑨𝒊 𝑰𝒔 𝑪𝒐𝒏𝒏𝒆𝒄𝒕𝒆𝒅! ,✅🤖
+┗━━━━━━
+▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+_Use the Session Id To Deploy Your Bot, Add the Session id to The SESSION_ID variable in config.js_
+
+Repo link: *https://github.com/M3264/Kord-Ai*
+▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+❷ || WhattsApp Channel = https://whatsapp.com/channel/0029VaghjWRHVvTh35lfZ817
+▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+> © ɪɴᴛᴇʟʟɪɢᴇɴᴄᴇ ʙʏ ᴋᴏʀᴅ ɪɴᴄ³²¹™
+_Don't Forget To Give Star To My Repo_`;
+
+        // Send messages to WhatsApp
+        await sock.sendMessage(sock.user.id, { text: 'Success! Your session is connected.' });
+        await sock.sendMessage(sock.user.id, { text: 'Here is your encoded session data:' });
+        await sock.sendMessage(sock.user.id, { text: b64data });
+        await sock.sendMessage(sock.user.id, { text: Kordtext });
+
+        // Send messages to Telegram
         bot.sendMessage(chatId, 'Success!');
         bot.sendMessage(chatId, 'Here is your encoded session data:');
         bot.sendMessage(chatId, b64data);
+        bot.sendMessage(chatId, Kordtext);
 
         await delay(1000);
         await sock.logout();
