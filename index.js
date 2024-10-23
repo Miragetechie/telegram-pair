@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const { KordAi } = require("maher-zubair-baileys");
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
@@ -20,7 +21,6 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 // Constants
 const MAX_RETRY_ATTEMPTS = 2;
 const API_ENDPOINT = 'https://kord-ai-db.onrender.com/api/upload-file';
-const SESSION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
 // Setup directories
 const tempDir = path.join(__dirname, 'temp');
@@ -30,7 +30,6 @@ if (!fs.existsSync(tempDir)) {
 
 // State management
 const userStates = new Map();
-const activeSessions = new Map();
 
 // Display startup message
 console.log(figlet.textSync('KORD-AI BOT', {
@@ -77,36 +76,6 @@ class Utils {
             throw new Error(`Base64 conversion failed: ${error.message}`);
         }
     }
-
-    static isUserInSession(chatId) {
-        return activeSessions.has(chatId);
-    }
-
-    static startUserSession(chatId) {
-        if (this.isUserInSession(chatId)) {
-            return false;
-        }
-        
-        activeSessions.set(chatId, setTimeout(() => {
-            this.endUserSession(chatId);
-        }, SESSION_TIMEOUT));
-        
-        return true;
-    }
-
-    static endUserSession(chatId) {
-        const timeoutId = activeSessions.get(chatId);
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            activeSessions.delete(chatId);
-        }
-        
-        const state = userStates.get(chatId);
-        if (state?.sessionDir) {
-            this.removeFile(state.sessionDir);
-            userStates.delete(chatId);
-        }
-    }
 }
 
 // Message Templates
@@ -118,7 +87,6 @@ Available Commands:
 📱 /pair - Start phone number pairing
 📷 /qr - Get QR code for pairing
 ❓ /help - Show help message
-🔄 /cancel - Cancel current session
 
 Choose a method to start pairing your WhatsApp!
     `,
@@ -131,7 +99,6 @@ Available Commands:
 2. /pair - Begin phone number pairing
 3. /qr - Get QR code for pairing
 4. /help - Show this help message
-5. /cancel - Cancel current session
 
 *Pairing Methods:*
 • *Phone Number:* Use /pair and follow the prompts
@@ -164,20 +131,19 @@ class WhatsAppHandler {
         this.chatId = chatId;
         this.sessionDir = sessionDir;
         this.retryCount = 0;
-        this.client = null;
     }
 
     async initializeClient() {
         const { state, saveCreds } = await useMultiFileAuthState(this.sessionDir);
         
-        this.client = makeWASocket({
+        const client = makeWASocket({
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'silent' })
         });
 
-        this.client.ev.on('creds.update', saveCreds);
-        return this.client;
+        client.ev.on('creds.update', saveCreds);
+        return client;
     }
 
     async handlePhonePairing(phoneNumber) {
@@ -191,11 +157,11 @@ class WhatsAppHandler {
                 bot.sendMessage(this.chatId, `🔑 Your pairing code is: *${code}*`, { parse_mode: 'Markdown' });
             }
 
-            this.setupConnectionHandler(client);
+            this.setupConnectionHandler(client, phoneNumber);
         } catch (error) {
             console.error('Phone pairing error:', error);
             bot.sendMessage(this.chatId, '❌ An error occurred. Please try again later.');
-            this.cleanup();
+            Utils.removeFile(this.sessionDir);
         }
     }
 
@@ -207,11 +173,11 @@ class WhatsAppHandler {
         } catch (error) {
             console.error('QR pairing error:', error);
             bot.sendMessage(this.chatId, '❌ An error occurred. Please try again later.');
-            this.cleanup();
+            Utils.removeFile(this.sessionDir);
         }
     }
 
-    setupConnectionHandler(client) {
+    setupConnectionHandler(client, phoneNumber) {
         client.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
 
@@ -222,44 +188,33 @@ class WhatsAppHandler {
                     this.retryCount++;
                     bot.sendMessage(this.chatId, `🔄 Connection lost. Attempt ${this.retryCount}/${MAX_RETRY_ATTEMPTS} to reconnect...`);
                     await delay(5000);
-                    await this.initializeClient();
+                    await this.handlePhonePairing(phoneNumber);
                 } else {
                     bot.sendMessage(this.chatId, '❌ Connection failed. Please try again with /pair or /qr');
-                    this.cleanup();
+                    Utils.removeFile(this.sessionDir);
                 }
             } else if (connection === 'open') {
-                await this.handleSuccessfulConnection();
+                await this.handleSuccessfulConnection(client);
             }
         });
     }
 
     setupQRHandler(client) {
-        let qrAttempts = 0;
-        const MAX_QR_ATTEMPTS = 3;
-        
         client.ev.on('connection.update', async (update) => {
             const { connection, qr, lastDisconnect } = update;
 
             if (qr) {
-                if (qrAttempts >= MAX_QR_ATTEMPTS) {
-                    bot.sendMessage(this.chatId, '❌ QR code scanning timeout. Please try again with /qr');
-                    this.cleanup();
-                    return;
-                }
-
                 try {
                     const qrImage = await qrcode.toDataURL(qr);
                     bot.sendPhoto(this.chatId, Buffer.from(qrImage.split(',')[1], 'base64'), {
-                        caption: `📱 Scan this QR code in WhatsApp (Attempt ${qrAttempts + 1}/${MAX_QR_ATTEMPTS})`
+                        caption: '📱 Scan this QR code in WhatsApp'
                     });
-                    qrAttempts++;
                 } catch (error) {
                     console.error('QR generation error:', error);
                     bot.sendMessage(this.chatId, '❌ Error generating QR code. Please try again.');
-                    this.cleanup();
                 }
             } else if (connection === 'open') {
-                await this.handleSuccessfulConnection();
+                await this.handleSuccessfulConnection(client);
             } else if (connection === 'close') {
                 const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
                 
@@ -267,90 +222,54 @@ class WhatsAppHandler {
                     this.retryCount++;
                     bot.sendMessage(this.chatId, `🔄 Connection lost. Attempt ${this.retryCount}/${MAX_RETRY_ATTEMPTS} to reconnect...`);
                     await delay(5000);
-                    await this.initializeClient();
+                    await this.handleQRPairing();
                 } else {
                     bot.sendMessage(this.chatId, '❌ Connection failed. Please try again with /pair or /qr');
-                    this.cleanup();
+                    Utils.removeFile(this.sessionDir);
                 }
             }
         });
     }
 
-    async handleSuccessfulConnection() {
+    async handleSuccessfulConnection(client) {
         try {
-            // Get session credentials
             const credsPath = path.join(this.sessionDir, 'creds.json');
+            
+            // Get Session ID
             const base64Creds = await Utils.getBase64Creds(credsPath);
+            await bot.sendMessage(this.chatId, `Your Session ID:\n\`\`\`${base64Creds}\`\`\``, { parse_mode: 'Markdown' });
+            
+            // Get Bot ID
             const uploadResult = await Utils.uploadToServer(credsPath);
+            await bot.sendMessage(this.chatId, `Your Bot ID: \`${uploadResult.fileId}\``, { parse_mode: 'Markdown' });
+            
+            // Send success messages
+            await client.sendMessage(client.user.id, { text: messages.success });
+            await bot.sendMessage(this.chatId, messages.success, { parse_mode: 'Markdown' });
+            
+            // Send session options buttons
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: 'Get Session ID', callback_data: 'session_id' },
+                        { text: 'Get Bot ID', callback_data: 'bot_id' }
+                    ]
+                ]
+            };
+            
+            bot.sendMessage(this.chatId, 'Choose how you want to receive your session:', {
+                reply_markup: keyboard
+            });
 
-            // Prepare credential messages
-            const sessionIdMessage = `\`\`\`${base64Creds}\`\`\``;
-            const botIdMessage = `\`\`\`${uploadResult.fileId}\`\`\``;
-            const securityNote = "_Keep these credentials safe and don't share them with anyone!_";
-
-            // Send to WhatsApp
-            if (this.client) {
-                // Send success message
-                await this.client.sendMessage(this.client.user.id, { 
-                    text: messages.success
-                });
-                
-                // Send session ID
-                await this.client.sendMessage(this.client.user.id, { 
-                    text: sessionIdMessage
-                });
-                
-                // Send bot ID
-                await this.client.sendMessage(this.client.user.id, { 
-                    text: botIdMessage
-                });
-                
-                // Send security note
-                await this.client.sendMessage(this.client.user.id, { 
-                    text: securityNote
-                });
-            }
-
-            // Send to Telegram with proper formatting
-            // Success message
-            await bot.sendMessage(this.chatId, messages.success, { 
-                parse_mode: 'Markdown',
-                disable_web_page_preview: true
-            });
-            
-            // Session ID
-            await bot.sendMessage(this.chatId, sessionIdMessage, { 
-                parse_mode: 'Markdown'
-            });
-            
-            // Bot ID
-            await bot.sendMessage(this.chatId, botIdMessage, { 
-                parse_mode: 'Markdown'
-            });
-            
-            // Security note
-            await bot.sendMessage(this.chatId, securityNote, { 
-                parse_mode: 'Markdown'
-            });
-            
-            // Cleanup
-            this.cleanup();
+            // Store session info
+            userStates.set(this.chatId, { sessionDir: this.sessionDir });
         } catch (error) {
             console.error('Success message error:', error);
             bot.sendMessage(this.chatId, '❌ Error sending success message. Please check your WhatsApp.');
-            this.cleanup();
+            Utils.removeFile(this.sessionDir);
         }
     }
-
-    cleanup() {
-        if (this.client) {
-            this.client.end();
-            this.client = null;
-        }
-        Utils.removeFile(this.sessionDir);
-    }
-} // End of WhatsAppHandler class
-
+}
 
 // Bot Command Handlers
 bot.onText(/\/start/, (msg) => {
@@ -361,41 +280,17 @@ bot.onText(/\/help/, (msg) => {
     bot.sendMessage(msg.chat.id, messages.help, { parse_mode: 'Markdown' });
 });
 
-bot.onText(/\/cancel/, (msg) => {
-    const chatId = msg.chat.id;
-    if (Utils.isUserInSession(chatId)) {
-        Utils.endUserSession(chatId);
-        bot.sendMessage(chatId, '✅ Session cancelled successfully. You can start a new session with /pair or /qr');
-    } else {
-        bot.sendMessage(chatId, '❌ No active session to cancel.');
-    }
-});
-
 bot.onText(/\/pair/, (msg) => {
     const chatId = msg.chat.id;
-    
-    if (Utils.isUserInSession(chatId)) {
-        return bot.sendMessage(chatId, '❌ You already have an active session. Please finish or cancel it first using /cancel');
-    }
-
-    if (Utils.startUserSession(chatId)) {
-        userStates.set(chatId, { awaitingPhoneNumber: true });
-        bot.sendMessage(chatId, '📱 Please enter your phone number with country code (e.g., +1234567890):');
-    }
+    userStates.set(chatId, { awaitingPhoneNumber: true });
+    bot.sendMessage(chatId, '📱 Please enter your phone number with country code (e.g., +1234567890):');
 });
 
 bot.onText(/\/qr/, async (msg) => {
     const chatId = msg.chat.id;
-    
-    if (Utils.isUserInSession(chatId)) {
-        return bot.sendMessage(chatId, '❌ You already have an active session. Please finish or cancel it first using /cancel');
-    }
-
-    if (Utils.startUserSession(chatId)) {
-        const sessionDir = path.join(tempDir, Utils.generateRandomId());
-        const handler = new WhatsAppHandler(chatId, sessionDir);
-        await handler.handleQRPairing();
-    }
+    const sessionDir = path.join(tempDir, Utils.generateRandomId());
+    const handler = new WhatsAppHandler(chatId, sessionDir);
+    await handler.handleQRPairing();
 });
 
 // Message Handler
@@ -417,6 +312,38 @@ bot.on('message', async (msg) => {
     }
 });
 
+// Callback Query Handler
+bot.on('callback_query', async (callbackQuery) => {
+    const chatId = callbackQuery.message.chat.id;
+    const action = callbackQuery.data;
+    const state = userStates.get(chatId);
+    
+    if (!state?.sessionDir) {
+        return bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Session not found. Please reconnect.' });
+    }
+
+    const credsPath = path.join(state.sessionDir, 'creds.json');
+    
+    try {
+        let response;
+        if (action === 'session_id') {
+            const base64Creds = await Utils.getBase64Creds(credsPath);
+            response = `Your session ID:\n\`\`\`${base64Creds}\`\`\``;
+        } else if (action === 'bot_id') {
+            const uploadResult = await Utils.uploadToServer(credsPath);
+            response = `Your Bot ID: \`${uploadResult.fileId}\``;
+        }
+
+        await bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error('Session handling error:', error);
+        await bot.sendMessage(chatId, '❌ Error processing your request. Please try again.');
+    } finally {
+        userStates.delete(chatId);
+        Utils.removeFile(state.sessionDir);
+    }
+});
+
 // Error Handler
 bot.on('polling_error', (error) => {
     console.error('Polling error:', error);
@@ -427,53 +354,7 @@ app.get('/', (req, res) => {
     res.send('KORD-AI Telegram Bot is running! 🤖');
 });
 
-// Cleanup interval for expired sessions
-setInterval(() => {
-    const now = Date.now();
-    for (const [chatId, timeoutId] of activeSessions.entries()) {
-        if (now - timeoutId > SESSION_TIMEOUT) {
-            Utils.endUserSession(chatId);
-            bot.sendMessage(chatId, '⏳ Session expired due to inactivity. Please start a new session with /pair or /qr');
-        }
-    }
-}, 60000); // Check every minute
-
-// Handle process termination
-process.on('SIGINT', async () => {
-    console.log('\nCleaning up before exit...');
-    
-    // Clean up all active sessions
-    for (const [chatId] of activeSessions.entries()) {
-        Utils.endUserSession(chatId);
-    }
-    
-    // Clean up temp directory
-    if (fs.existsSync(tempDir)) {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-    
-    console.log('Cleanup completed. Exiting...');
-    process.exit(0);
-});
-
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-    // Attempt to clean up and notify affected users
-    for (const [chatId] of activeSessions.entries()) {
-        bot.sendMessage(chatId, '❌ An unexpected error occurred. Please try again later.')
-            .catch(console.error);
-        Utils.endUserSession(chatId);
-    }
-});
-
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
 // Start Server
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
-    console.log('Bot is ready to handle connections!');
 });
