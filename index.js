@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const { KordAi } = require("maher-zubair-baileys");
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
@@ -14,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Initialize Telegram Bot
-const TOKEN = 'YOUR_BOT_TOKEN';
+const TOKEN = '7740666373:AAEZxNT8vpNx1il_GUAf9qYxRCHl0ow97zQ';
 const bot = new TelegramBot(TOKEN, { polling: true });
 
 // Constants
@@ -341,6 +342,16 @@ class WhatsAppHandler {
             this.cleanup();
         }
     }
+
+    cleanup() {
+        if (this.client) {
+            this.client.end();
+            this.client = null;
+        }
+        Utils.removeFile(this.sessionDir);
+    }
+} // End of WhatsAppHandler class
+
 
 // Bot Command Handlers
 bot.onText(/\/start/, (msg) => {
