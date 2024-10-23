@@ -1,6 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
@@ -19,6 +19,7 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 
 // Constants
 const MAX_RETRY_ATTEMPTS = 2;
+const MAX_QR_ATTEMPTS = 2;
 const API_ENDPOINT = 'https://kord-ai-db.onrender.com/api/upload-file';
 
 // Setup directories
@@ -130,7 +131,8 @@ class WhatsAppHandler {
         this.chatId = chatId;
         this.sessionDir = sessionDir;
         this.retryCount = 0;
-        this.qrAttempts = 0;
+        this.qrSentCount = 0;
+        this.waClient = null;
     }
 
     async initializeClient() {
@@ -139,11 +141,11 @@ class WhatsAppHandler {
         const client = makeWASocket({
             auth: state,
             printQRInTerminal: false,
-            logger: pino({ level: 'silent' }),
-            browser: ['KORD-AI', 'Chrome', '1.0.0']
+            logger: pino({ level: 'silent' })
         });
 
         client.ev.on('creds.update', saveCreds);
+        this.waClient = client;
         return client;
     }
 
@@ -158,7 +160,7 @@ class WhatsAppHandler {
                 bot.sendMessage(this.chatId, `🔑 Your pairing code is: *${code}*`, { parse_mode: 'Markdown' });
             }
 
-            this.setupConnectionHandler(client);
+            this.setupConnectionHandler(client, phoneNumber);
         } catch (error) {
             console.error('Phone pairing error:', error);
             bot.sendMessage(this.chatId, '❌ An error occurred. Please try again later.');
@@ -178,7 +180,46 @@ class WhatsAppHandler {
         }
     }
 
-    setupConnectionHandler(client) {
+    setupQRHandler(client) {
+        client.ev.on('connection.update', async (update) => {
+            const { connection, qr, lastDisconnect } = update;
+
+            if (qr) {
+                if (this.qrSentCount >= MAX_QR_ATTEMPTS) {
+                    bot.sendMessage(this.chatId, '❌ QR code limit reached. Please use /qr to request a new session.');
+                    Utils.removeFile(this.sessionDir);
+                    return;
+                }
+
+                try {
+                    const qrImage = await qrcode.toDataURL(qr);
+                    bot.sendPhoto(this.chatId, Buffer.from(qrImage.split(',')[1], 'base64'), {
+                        caption: `📱 Scan this QR code in WhatsApp (Attempt ${this.qrSentCount + 1}/${MAX_QR_ATTEMPTS})`
+                    });
+                    this.qrSentCount++;
+                } catch (error) {
+                    console.error('QR generation error:', error);
+                    bot.sendMessage(this.chatId, '❌ Error generating QR code. Please try again.');
+                }
+            } else if (connection === 'open') {
+                await this.handleSuccessfulConnection(client);
+            } else if (connection === 'close') {
+                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                
+                if (shouldReconnect && this.retryCount < MAX_RETRY_ATTEMPTS) {
+                    this.retryCount++;
+                    bot.sendMessage(this.chatId, `🔄 Connection lost. Attempt ${this.retryCount}/${MAX_RETRY_ATTEMPTS} to reconnect...`);
+                    await delay(5000);
+                    await this.handleQRPairing();
+                } else {
+                    bot.sendMessage(this.chatId, '❌ Connection failed. Please try again with /pair or /qr');
+                    Utils.removeFile(this.sessionDir);
+                }
+            }
+        });
+    }
+
+    setupConnectionHandler(client, phoneNumber) {
         client.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
 
@@ -200,84 +241,33 @@ class WhatsAppHandler {
         });
     }
 
-    setupQRHandler(client) {
-        client.ev.on('connection.update', async (update) => {
-            const { connection, qr, lastDisconnect } = update;
-
-            if (qr && this.qrAttempts < 2) {
-                this.qrAttempts++;
-                try {
-                    const qrImage = await qrcode.toDataURL(qr);
-                    bot.sendPhoto(this.chatId, Buffer.from(qrImage.split(',')[1], 'base64'), {
-                        caption: `📱 Scan this QR code in WhatsApp (Attempt ${this.qrAttempts}/2)`
-                    });
-
-                    if (this.qrAttempts === 2) {
-                        setTimeout(() => {
-                            if (!client.user) {
-                                bot.sendMessage(this.chatId, '❌ QR code scanning timeout. Please try again with /qr');
-                                Utils.removeFile(this.sessionDir);
-                                client.end();
-                            }
-                        }, 60000); // Wait 1 minute after second QR
-                    }
-                } catch (error) {
-                    console.error('QR generation error:', error);
-                    bot.sendMessage(this.chatId, '❌ Error generating QR code. Please try again.');
-                }
-            } else if (connection === 'open') {
-                await this.handleSuccessfulConnection(client);
-            } else if (connection === 'close') {
-                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                
-                if (shouldReconnect && this.retryCount < MAX_RETRY_ATTEMPTS && this.qrAttempts < 2) {
-                    this.retryCount++;
-                    bot.sendMessage(this.chatId, `🔄 Connection lost. Attempt ${this.retryCount}/${MAX_RETRY_ATTEMPTS} to reconnect...`);
-                    await delay(5000);
-                    await this.handleQRPairing();
-                } else {
-                    bot.sendMessage(this.chatId, '❌ Connection failed. Please try again with /pair or /qr');
-                    Utils.removeFile(this.sessionDir);
-                }
-            }
-        });
-    }
-
     async handleSuccessfulConnection(client) {
         try {
-            // Send success message to both platforms
-            await client.sendMessage(client.user.id, { text: messages.success });
-            await bot.sendMessage(this.chatId, messages.success, { parse_mode: 'Markdown' });
-            
-            // Generate credentials
             const credsPath = path.join(this.sessionDir, 'creds.json');
+            
+            // Get both session ID and bot ID
             const base64Creds = await Utils.getBase64Creds(credsPath);
             const uploadResult = await Utils.uploadToServer(credsPath);
+            
+            // Send success message to WhatsApp
+            const sessionMessage = `*Your KORD-AI Bot Credentials*\n\n` +
+                `*Session ID:*\n\`\`\`${base64Creds}\`\`\`\n\n` +
+                `*Bot ID:*\n\`${uploadResult.fileId}\`\n\n` +
+                `_Use either of these credentials to deploy your bot._\n\n` +
+                messages.success;
 
-            const credentialsMessage = `
-🔐 *Your KORD-AI Bot Credentials*
+            await client.sendMessage(client.user.id, { text: sessionMessage });
 
-1️⃣ *Session ID:*
-\`\`\`
-${base64Creds}
-\`\`\`
+            // Send success message to Telegram
+            await bot.sendMessage(this.chatId, messages.success, { parse_mode: 'Markdown' });
+            await bot.sendMessage(this.chatId, 'ℹ️ Your credentials have been sent to your WhatsApp. Please check your messages.');
 
-2️⃣ *Bot ID:*
-\`${uploadResult.fileId}\`
-
-You can use either of these credentials to deploy your bot. 
-Choose the method that works best for you!
-
-Need help deploying? Type /help for guidance.`;
-
-            // Send credentials to both platforms
-            await bot.sendMessage(this.chatId, credentialsMessage, { parse_mode: 'Markdown' });
-            await client.sendMessage(client.user.id, { text: credentialsMessage });
-
+            // Clean up
+            userStates.delete(this.chatId);
+            Utils.removeFile(this.sessionDir);
         } catch (error) {
             console.error('Success message error:', error);
             bot.sendMessage(this.chatId, '❌ Error sending credentials. Please try again.');
-        } finally {
             Utils.removeFile(this.sessionDir);
         }
     }
