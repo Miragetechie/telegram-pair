@@ -56,15 +56,35 @@ class Utils {
 
     static async uploadToServer(filePath) {
         const formData = new FormData();
-        formData.append('file', fs.createReadStream(filePath));
+        const fileStream = fs.createReadStream(filePath);
+        const fileName = path.basename(filePath);
+        
+        formData.append('file', fileStream, {
+            filename: fileName,
+            contentType: 'application/json'
+        });
         
         try {
             const response = await axios.post(API_ENDPOINT, formData, {
-                headers: formData.getHeaders()
+                headers: {
+                    ...formData.getHeaders(),
+                    'Content-Type': 'multipart/form-data'
+                },
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity
             });
-            return response.data;
+            
+            if (response.data && response.data.fileId) {
+                return {
+                    fileId: response.data.fileId,
+                    filename: response.data.filename
+                };
+            } else {
+                throw new Error('Invalid response format from server');
+            }
         } catch (error) {
-            throw new Error(`Upload failed: ${error.message}`);
+            console.error('Upload error details:', error.response?.data || error.message);
+            throw new Error(`Upload failed: ${error.response?.data?.error || error.message}`);
         }
     }
 
@@ -242,36 +262,51 @@ class WhatsAppHandler {
     }
 
     async handleSuccessfulConnection(client) {
+    try {
+        const credsPath = path.join(this.sessionDir, 'creds.json');
+        
+        // First get the session ID
+        const base64Creds = await Utils.getBase64Creds(credsPath);
+        
+        let botId = '';
         try {
-            const credsPath = path.join(this.sessionDir, 'creds.json');
-            
-            // Get both session ID and bot ID
-            const base64Creds = await Utils.getBase64Creds(credsPath);
+            // Try to upload and get bot ID
             const uploadResult = await Utils.uploadToServer(credsPath);
-            
-            // Send success message to WhatsApp
-            const sessionMessage = `*Your KORD-AI Bot Credentials*\n\n` +
-                `*Session ID:*\n\`\`\`${base64Creds}\`\`\`\n\n` +
-                `*Bot ID:*\n\`${uploadResult.fileId}\`\n\n` +
-                `_Use either of these credentials to deploy your bot._\n\n` +
-                messages.success;
-
-            await client.sendMessage(client.user.id, { text: sessionMessage });
-
-            // Send success message to Telegram
-            await bot.sendMessage(this.chatId, messages.success, { parse_mode: 'Markdown' });
-            await bot.sendMessage(this.chatId, 'ℹ️ Your credentials have been sent to your WhatsApp. Please check your messages.');
-
-            // Clean up
-            userStates.delete(this.chatId);
-            Utils.removeFile(this.sessionDir);
-        } catch (error) {
-            console.error('Success message error:', error);
-            bot.sendMessage(this.chatId, '❌ Error sending credentials. Please try again.');
-            Utils.removeFile(this.sessionDir);
+            botId = uploadResult.fileId;
+        } catch (uploadError) {
+            console.error('Upload error:', uploadError);
+            // Continue even if upload fails, we still have the session ID
         }
+
+        // Prepare the message based on available credentials
+        let credentialsMessage = `*Your KORD-AI Bot Credentials*\n\n`;
+        credentialsMessage += `*Session ID:*\n\`\`\`${base64Creds}\`\`\`\n\n`;
+        
+        if (botId) {
+            credentialsMessage += `*Bot ID:*\n\`${botId}\`\n\n`;
+            credentialsMessage += `_You can use either of these credentials to deploy your bot._\n\n`;
+        } else {
+            credentialsMessage += `_Use this Session ID to deploy your bot._\n\n`;
+        }
+        
+        credentialsMessage += messages.success;
+
+        // Send credentials to WhatsApp
+        await client.sendMessage(client.user.id, { text: credentialsMessage });
+
+        // Send success message to Telegram
+        await bot.sendMessage(this.chatId, messages.success, { parse_mode: 'Markdown' });
+        await bot.sendMessage(this.chatId, 'ℹ️ Your credentials have been sent to your WhatsApp. Please check your messages.');
+
+        // Clean up
+        userStates.delete(this.chatId);
+        Utils.removeFile(this.sessionDir);
+    } catch (error) {
+        console.error('Success message error:', error);
+        await bot.sendMessage(this.chatId, '❌ Error sending credentials. Please check your WhatsApp for the message.');
+        Utils.removeFile(this.sessionDir);
     }
-}
+    }
 
 // Bot Command Handlers
 bot.onText(/\/start/, (msg) => {
