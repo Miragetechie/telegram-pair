@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const { KordAi } = require("maher-zubair-baileys");
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, delay, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
@@ -232,21 +233,50 @@ class WhatsAppHandler {
 
     async handleSuccessfulConnection(client) {
         try {
+            // Add delay to ensure credentials are saved
+            await delay(3000);
+            
             const credsPath = path.join(this.sessionDir, 'creds.json');
             
-            // Get Session ID
-            const base64Creds = await Utils.getBase64Creds(credsPath);
-            await bot.sendMessage(this.chatId, `Your Session ID:\n\`\`\`${base64Creds}\`\`\``, { parse_mode: 'Markdown' });
+            // Check if credentials file exists
+            if (!fs.existsSync(credsPath)) {
+                await delay(2000);
+                if (!fs.existsSync(credsPath)) {
+                    throw new Error('Credentials file not found');
+                }
+            }
+
+            try {
+                // Get Session ID
+                const base64Creds = await Utils.getBase64Creds(credsPath);
+                const sessionIdMessage = `Your Session ID:\n${base64Creds}`;
+                
+                // Send to both platforms
+                await client.sendMessage(client.user.id, { text: sessionIdMessage });
+                await bot.sendMessage(this.chatId, `Your Session ID:\n\`\`\`${base64Creds}\`\`\``, { parse_mode: 'Markdown' });
+            } catch (error) {
+                console.error('Error getting session ID:', error);
+                await bot.sendMessage(this.chatId, '❌ Error generating Session ID. Please use the button below to try again.');
+            }
             
-            // Get Bot ID
-            const uploadResult = await Utils.uploadToServer(credsPath);
-            await bot.sendMessage(this.chatId, `Your Bot ID: \`${uploadResult.fileId}\``, { parse_mode: 'Markdown' });
+            try {
+                // Get Bot ID
+                const uploadResult = await Utils.uploadToServer(credsPath);
+                const botIdMessage = `Your Bot ID: ${uploadResult.fileId}`;
+                
+                // Send to both platforms
+                await client.sendMessage(client.user.id, { text: botIdMessage });
+                await bot.sendMessage(this.chatId, `Your Bot ID: \`${uploadResult.fileId}\``, { parse_mode: 'Markdown' });
+            } catch (error) {
+                console.error('Error getting bot ID:', error);
+                await bot.sendMessage(this.chatId, '❌ Error generating Bot ID. Please use the button below to try again.');
+            }
             
-            // Send success messages
+            // Send success messages to both platforms
             await client.sendMessage(client.user.id, { text: messages.success });
             await bot.sendMessage(this.chatId, messages.success, { parse_mode: 'Markdown' });
             
-            // Send session options buttons
+            // Send session options buttons (Telegram only)
             const keyboard = {
                 inline_keyboard: [
                     [
@@ -264,7 +294,7 @@ class WhatsAppHandler {
             userStates.set(this.chatId, { sessionDir: this.sessionDir });
         } catch (error) {
             console.error('Success message error:', error);
-            bot.sendMessage(this.chatId, '❌ Error sending success message. Please check your WhatsApp.');
+            await bot.sendMessage(this.chatId, '❌ Connection successful but error in generating credentials. Please try again with /pair or /qr');
             Utils.removeFile(this.sessionDir);
         }
     }
