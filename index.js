@@ -54,26 +54,36 @@ class Utils {
     }
 
     static async uploadToServer(filePath) {
+    static async uploadToServer(filePath) {
     try {
         // Read the file content
         const fileContent = await fs.promises.readFile(filePath, 'utf8');
         
-        // Parse the JSON content (assuming the file contains JSON)
+        // Parse the JSON content
         const jsonData = JSON.parse(fileContent);
         
         // Make the API request
         const response = await axios.post('https://kordai-dash.vercel.app/api/files/upload-creds', jsonData, {
             headers: {
                 'Content-Type': 'application/json',
-                // Add your API key header here if required by validateApiKey middleware
                 'x-api-Key': 'kordAi.key'
             }
         });
 
-        // Return the response data which includes fileId, filename, size, checksum, and uploadedAt
-        return response.data;
+        // Check if response has the expected structure
+        if (response.data && response.data.status === 'success' && response.data.data) {
+            return {
+                fileId: response.data.data.fileId,
+                filename: response.data.data.filename,
+                size: response.data.data.size,
+                checksum: response.data.data.checksum,
+                uploadedAt: response.data.data.uploadedAt
+            };
+        } else {
+            throw new Error('Invalid response format from server');
+        }
     } catch (error) {
-        // Handle different types of errors
+        // Enhanced error handling
         if (error.code === 'ENOENT') {
             throw new Error(`File not found: ${filePath}`);
         }
@@ -81,10 +91,12 @@ class Utils {
             throw new Error(`Invalid JSON in file: ${error.message}`);
         }
         if (error.response) {
-            // API responded with an error
+            // Log the full error response for debugging
+            console.error('Server response error:', error.response.data);
             throw new Error(`Upload failed: ${error.response.data.message || error.response.statusText}`);
         }
-        // Generic error handling
+        // Log the full error for debugging
+        console.error('Upload error:', error);
         throw new Error(`Upload failed: ${error.message}`);
     }
 }
