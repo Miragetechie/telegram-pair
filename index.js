@@ -54,7 +54,6 @@ class Utils {
     }
 
     static async uploadToServer(filePath) {
-    static async uploadToServer(filePath) {
     try {
         // Read the file content
         const fileContent = await fs.promises.readFile(filePath, 'utf8');
