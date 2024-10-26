@@ -64,9 +64,9 @@ class Utils {
         // Make the API request
         const response = await axios.post('https://kordai-dash.vercel.app/api/files/upload-creds', jsonData, {
             headers: {
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
                 // Add your API key header here if required by validateApiKey middleware
-                'X-API-Key': 'kordAi.key'
+                'x-api-Key': 'kordAi.key'
             }
         });
 
